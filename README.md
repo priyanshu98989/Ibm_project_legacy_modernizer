@@ -87,8 +87,12 @@ legacy-modernizer/
         │   └── jobs.js         # In-memory job store
         ├── parsers/
         │   ├── index.js        # Language registry (add new languages here)
+        │   ├── sanitize.js     # Strips comments/strings before risk rules run
         │   ├── java.js         # Heuristic Java parser
-        │   └── cobol.js        # Heuristic COBOL parser
+        │   ├── cobol.js        # Heuristic COBOL parser
+        │   ├── javascript.js   # Heuristic JavaScript parser
+        │   ├── typescript.js   # Heuristic TypeScript parser
+        │   └── python.js       # Heuristic Python parser
         ├── services/
         │   ├── fileScanner.js      # Recursive directory walker
         │   ├── dependencyMapper.js # Graph builder
@@ -132,15 +136,19 @@ legacy-modernizer/
 
 ## Adding a new language
 
-1. Create `server/src/parsers/<lang>.js` — must export `extractDependencies(file)`.
+1. Create `server/src/parsers/<lang>.js` — must export `extractDependencies(file)` and `hasTestCode(content)`.
 2. Add the extension mapping in `server/src/parsers/index.js`.
 3. Add scoring logic in `server/src/services/riskScorer.js`.
+4. Match risk patterns against `stripCommentsAndStrings(content)`, not the raw text — see `parsers/sanitize.js`. If the pattern needs to see inside a string (secret detection), use `stripComments(content)` instead.
 
 ---
 
 ## Design decisions & trade-offs
 
 - **Heuristic parsing** — regex-based, not a full AST. Fast and dependency-free; misses some edge cases.
+- **Sanitised matching** — every risk rule runs against a copy of the file with comments and string literals blanked out (`parsers/sanitize.js`). Without this, a file that merely *mentions* `eval()` in a comment or a result-message string gets flagged for it. Imports and TODO comments are read from the raw source, since module paths live inside strings and TODOs live inside comments.
+- **Block-aware nesting** — only block-opening braces count toward nesting depth. Counting every `{` reported plain object literals and JSX as "deeply nested logic".
+- **Test coverage is repo-level, not per-file** — almost no source file contains its own tests, so scoring it per file fired on 100% of files and made a clean codebase unreachable. It is reported once as `meta.testCoveragePct`.
 - **In-memory job store** — no DB. Restart the server and jobs are gone. Fine for demo; replace with Redis for production.
 - **Client-side PDF** — uses `jspdf` + `html2canvas`; avoids server-side headless browser. Quality is limited for very tall reports.
 - **Top-5 Bob suggestions** — calling Bob for every file in a large repo would be very slow. Configurable via `MAX_BOB_SUGGESTIONS`.

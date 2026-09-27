@@ -52,14 +52,10 @@ const TODO_RE = /\/\/.*\b(TODO|FIXME|HACK|XXX)\b/gi;
 const SECRET_RE = /(?:password|passwd|apikey|api_key|secret|token)\s*[:=]\s*['"][^'"]{4,}['"]/gi;
 
 const path = require('path');
+const { stripComments, stripCommentsAndStrings, blockNestingDepth } = require('./sanitize');
 
-function maxNestingDepth(content) {
-  let depth = 0, max = 0;
-  for (const ch of content) {
-    if (ch === '{') { depth++; if (depth > max) max = depth; }
-    else if (ch === '}') depth = Math.max(0, depth - 1);
-  }
-  return max;
+function maxNestingDepth(code) {
+  return blockNestingDepth(code);
 }
 
 function hasTestCode(content) {
@@ -104,21 +100,26 @@ function extractDependencies(file) {
   while ((m = IMPORT_RE.exec(content)) !== null)  imports.add(resolveImportName(m[1]));
   while ((m = REQUIRE_RE.exec(content)) !== null) imports.add(resolveImportName(m[1]));
 
-  const anyTypeCount        = (content.match(ANY_TYPE_RE)       || []).length;
-  const asAnyCount          = (content.match(AS_ANY_RE)         || []).length;
-  const nonNullCount        = (content.match(NON_NULL_RE)       || []).length;
-  const tsSuppressionCount  = (content.match(TS_SUPPRESS_RE)    || []).length;
-  const consoleCount        = (content.match(CONSOLE_RE)        || []).length;
-  const evalCount           = (content.match(EVAL_RE)           || []).length;
+  // Secrets need string literals readable; everything else matches code only.
+  // Imports above and TODOs below are read from the raw source on purpose.
+  const forSecrets = stripComments(content);
+  const code = stripCommentsAndStrings(content);
+
+  const anyTypeCount        = (code.match(ANY_TYPE_RE)       || []).length;
+  const asAnyCount          = (code.match(AS_ANY_RE)         || []).length;
+  const nonNullCount        = (code.match(NON_NULL_RE)       || []).length;
+  const tsSuppressionCount  = (content.match(TS_SUPPRESS_RE) || []).length;
+  const consoleCount        = (code.match(CONSOLE_RE)        || []).length;
+  const evalCount           = (code.match(EVAL_RE)           || []).length;
 
   // Rough missing-return-type count: total function defs minus those with explicit return type
-  const totalFns      = (content.match(MISSING_RETURN_TYPE_RE) || []).length;
-  const typedFns      = (content.match(HAS_RETURN_TYPE_RE)     || []).length;
+  const totalFns      = (code.match(MISSING_RETURN_TYPE_RE) || []).length;
+  const typedFns      = (code.match(HAS_RETURN_TYPE_RE)     || []).length;
   const missingReturnTypes = Math.max(0, totalFns - typedFns);
 
   const secrets = [];
   SECRET_RE.lastIndex = 0;
-  while ((m = SECRET_RE.exec(content)) !== null) secrets.push(m[0].slice(0, 40));
+  while ((m = SECRET_RE.exec(forSecrets)) !== null) secrets.push(m[0].slice(0, 40));
 
   TODO_RE.lastIndex = 0;
   const todos = [];
@@ -135,9 +136,9 @@ function extractDependencies(file) {
     evalCount,
     secrets: secrets.slice(0, 5),
     todos,
-    maxNesting: maxNestingDepth(content),
+    maxNesting: maxNestingDepth(code),
     hasTests: hasTestCode(content),
   };
 }
 
-module.exports = { extractDependencies };
+module.exports = { extractDependencies, hasTestCode };

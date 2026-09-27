@@ -19,10 +19,14 @@
  *
  * Formula:
  *   base = 100
- *   - each high-risk file:    -10 points (capped at -50)
- *   - each medium-risk file:  -4  points (capped at -30)
- *   - each low-risk file:     -1  point  (capped at -10)
+ *   - each high-risk file:    -8 points (capped at -50)
+ *   - each medium-risk file:  -3 points (capped at -30)
+ *   - each low-risk file:      0 points
  *   floor at 0
+ *
+ * Low-risk files deliberately cost nothing.  Charging them a point made it
+ * arithmetically impossible for a clean codebase to score 100, because the
+ * count of low-risk files always dwarfs the count of real problems.
  *
  * @param {{ severity: string }[]} risks
  * @returns {number}
@@ -30,12 +34,10 @@
 function calculateHealthScore(risks) {
   const high   = risks.filter(r => r.severity === 'high').length;
   const medium = risks.filter(r => r.severity === 'medium').length;
-  const low    = risks.filter(r => r.severity === 'low').length;
 
   const penalty =
-    Math.min(high   * 10, 50) +
-    Math.min(medium * 4,  30) +
-    Math.min(low    * 1,  10);
+    Math.min(high   * 8, 50) +
+    Math.min(medium * 3, 30);
 
   return Math.max(0, 100 - penalty);
 }
@@ -93,12 +95,19 @@ function compileReport({ jobId, files, dependencyGraph, risks, suggestions, exec
   const healthScore = calculateHealthScore(risks);
   const refactorOrder = computeRefactorOrder(dependencyGraph, risks);
 
+  // Test coverage used to be scored on every individual file, which meant it
+  // fired on 100% of files and added a constant +1 to each one.  It is far more
+  // useful as a single repo-level number.
+  const testedFiles = files.filter(f => f.hasTests).length;
+
   return {
     meta: {
       jobId,
       generatedAt: new Date().toISOString(),
       fileCount: files.length,
       languages,
+      testedFiles,
+      testCoveragePct: files.length ? Math.round((testedFiles / files.length) * 100) : 0,
     },
     healthScore,
     executiveSummary,

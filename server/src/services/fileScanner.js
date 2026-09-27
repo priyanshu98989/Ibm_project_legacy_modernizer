@@ -3,7 +3,7 @@
  * Recursively walks a directory and reads all supported source files.
  *
  * Returns an array of file objects:
- *   [{ path: string (relative), language: string, content: string }]
+ *   [{ path: string (relative), language: string, content: string, hasTests: boolean }]
  *
  * Files larger than MAX_FILE_BYTES are skipped (noted in console).
  * Binary files and common non-source directories are ignored.
@@ -23,7 +23,7 @@ const MAX_FILE_BYTES = 2 * 1024 * 1024;
  * Walk `dir` recursively and collect all supported source files.
  * @param {string} dir - absolute path to walk
  * @param {string} rootDir - the job's root dir (for computing relative paths)
- * @returns {{ path: string, language: string, content: string }[]}
+ * @returns {{ path: string, language: string, content: string, hasTests: boolean }[]}
  */
 function scanDirectory(dir, rootDir) {
   const results = [];
@@ -68,6 +68,7 @@ function scanDirectory(dir, rootDir) {
         path: path.relative(rootDir, fullPath).replace(/\\/g, '/'), // normalise to forward-slash
         language: detected.language,
         content,
+        hasTests: detected.parser.hasTestCode(content),
       });
     }
   }

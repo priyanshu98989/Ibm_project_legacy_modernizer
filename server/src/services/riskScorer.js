@@ -13,7 +13,6 @@
  *     - maxNesting 5–7         → medium
  *     - deprecatedCount >= 3   → medium
  *     - antiPatterns present   → high (each unique one +1)
- *     - no tests               → low (+1)
  *     - todos >= 5             → low (+1)
  *
  *   COBOL:
@@ -22,7 +21,8 @@
  *     - performDepth >= 6      → medium
  *     - execSqlCount >= 1      → medium (embedded SQL)
  *     - hardcodedLiterals      → high (each +1)
- *     - no tests               → low (+1) (always true for COBOL in our parser)
+ *
+ * Note: test coverage is deliberately NOT a per-file rule — see scoreJava.
  */
 
 const javaParser       = require('../parsers/java');
@@ -91,10 +91,10 @@ function scoreJava(file) {
     score += 2;
   }
 
-  if (!meta.hasTests) {
-    issues.push('No unit test code detected in this file — changes carry regression risk.');
-    score += 1;
-  }
+  // NOTE: test coverage is intentionally NOT scored per file.  Almost no file
+  // contains its own tests, so the rule fired on 100% of files, added a
+  // constant +1 everywhere and guaranteed that nothing could ever be clean.
+  // It is now reported once at repo level (see reportCompiler meta.testedFiles).
 
   if (meta.todos.length >= 5) {
     issues.push(`${meta.todos.length} TODO/FIXME comments found — indicates unfinished or fragile code.`);
@@ -156,9 +156,7 @@ function scoreCobol(file) {
     score += 1;
   }
 
-  // COBOL files rarely have tests in legacy repos
-  issues.push('No automated test coverage detected — refactor changes carry high regression risk.');
-  score += 1;
+  // Test coverage is a repo-level concern — see the note in scoreJava.
 
   return { severity: scoreToSeverity(score), score, issues };
 }
@@ -206,10 +204,7 @@ function scoreJavaScript(file) {
     score += 1;
   }
 
-  if (!meta.hasTests) {
-    issues.push('No unit test code detected — changes carry regression risk.');
-    score += 1;
-  }
+  // Test coverage is a repo-level concern — see the note in scoreJava.
 
   if (meta.todos.length >= 3) {
     issues.push(`${meta.todos.length} TODO/FIXME comments — indicates unfinished or fragile code.`);
@@ -285,10 +280,7 @@ function scoreTypeScript(file) {
     score += 1;
   }
 
-  if (!meta.hasTests) {
-    issues.push('No unit test code detected — changes carry regression risk.');
-    score += 1;
-  }
+  // Test coverage is a repo-level concern — see the note in scoreJava.
 
   if (meta.todos.length >= 3) {
     issues.push(`${meta.todos.length} TODO/FIXME comments — indicates unfinished code.`);
@@ -353,10 +345,7 @@ function scorePython(file) {
     score += 1;
   }
 
-  if (!meta.hasTests) {
-    issues.push('No test code detected (pytest/unittest) — changes carry regression risk.');
-    score += 1;
-  }
+  // Test coverage is a repo-level concern — see the note in scoreJava.
 
   if (meta.todos.length >= 3) {
     issues.push(`${meta.todos.length} TODO/FIXME comments — indicates unfinished or fragile code.`);

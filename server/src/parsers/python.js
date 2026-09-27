@@ -14,6 +14,8 @@
  *   - Hardcoded secrets
  */
 
+const { stripComments, stripCommentsAndStrings } = require('./sanitize');
+
 // import foo  or  from foo import bar
 const IMPORT_RE = /^(?:import|from)\s+([\w.]+)/gm;
 
@@ -92,19 +94,25 @@ function extractDependencies(file) {
     imports.add(m[1].split('.')[0]);
   }
 
-  const bareExceptCount    = (content.match(BARE_EXCEPT_RE)    || []).length;
-  const printCount         = (content.match(PRINT_RE)          || []).length;
-  const evalCount          = (content.match(EVAL_RE)           || []).length;
-  const mutableDefaultCount = (content.match(MUTABLE_DEFAULT_RE) || []).length;
+  // Secrets need string literals readable; everything else matches code only.
+  // Imports above and TODOs below are read from the raw source on purpose.
+  const forSecrets = stripComments(content, { hashComments: true });
+  const code = stripCommentsAndStrings(content, { hashComments: true });
 
-  const totalFuncs   = (content.match(FUNC_DEF_RE)       || []).length;
-  const typedFuncs   = (content.match(FUNC_WITH_HINT_RE) || []).length;
+  const bareExceptCount    = (code.match(BARE_EXCEPT_RE)    || []).length;
+  const printCount         = (code.match(PRINT_RE)          || []).length;
+  const evalCount          = (code.match(EVAL_RE)           || []).length;
+  const mutableDefaultCount = (code.match(MUTABLE_DEFAULT_RE) || []).length;
+
+  const totalFuncs   = (code.match(FUNC_DEF_RE)       || []).length;
+  const typedFuncs   = (code.match(FUNC_WITH_HINT_RE) || []).length;
   const missingTypeHints = Math.max(0, totalFuncs - typedFuncs);
 
   const secrets = [];
   SECRET_RE.lastIndex = 0;
-  while ((m = SECRET_RE.exec(content)) !== null) secrets.push(m[0].slice(0, 40));
+  while ((m = SECRET_RE.exec(forSecrets)) !== null) secrets.push(m[0].slice(0, 40));
 
+  // TODOs live in comments, so read them from the raw source.
   TODO_RE.lastIndex = 0;
   const todos = [];
   while ((m = TODO_RE.exec(content)) !== null) todos.push(m[0].trim());
@@ -123,4 +131,4 @@ function extractDependencies(file) {
   };
 }
 
-module.exports = { extractDependencies };
+module.exports = { extractDependencies, hasTestCode };

@@ -16,6 +16,7 @@
  */
 
 const path = require('path');
+const { stripCommentsAndStrings, blockNestingDepth } = require('./sanitize');
 
 // Matches:  import com.example.Foo;   or  import static java.util.Arrays.*;
 const IMPORT_RE = /^\s*import\s+(?:static\s+)?([\w.]+(?:\.\*)?)\s*;/gm;
@@ -55,19 +56,18 @@ const MANUAL_CLOSE_RE = /\.\s*close\s*\(\s*\)/g;
 const TRY_WITH_RESOURCES_RE = /\btry\s*\(/g;
 
 /**
- * Count the maximum brace-nesting depth in a source string.
+ * Count the maximum block-nesting depth in a source string.
  * This is a proxy for cyclomatic complexity / deeply nested logic.
- * @param {string} content
+ *
+ * Only block-opening braces are counted — object initialisers, anonymous-class
+ * double-brace idioms aside, plain `{ ... }` data blocks must not be reported
+ * as nested logic.
+ *
+ * @param {string} code  pre-sanitised source (comments and strings blanked)
  * @returns {number}
  */
-function maxNestingDepth(content) {
-  let depth = 0;
-  let max = 0;
-  for (const ch of content) {
-    if (ch === '{') { depth++; if (depth > max) max = depth; }
-    else if (ch === '}') { depth = Math.max(0, depth - 1); }
-  }
-  return max;
+function maxNestingDepth(code) {
+  return blockNestingDepth(code);
 }
 
 /**
@@ -133,9 +133,9 @@ function countUncheckedCasts(content) {
  * @param {string} content
  * @returns {boolean} true if manual close() found without matching try-with-resources
  */
-function hasMissingTryWithResources(content) {
-  const closeCount = (content.match(MANUAL_CLOSE_RE) || []).length;
-  const tryWithCount = (content.match(TRY_WITH_RESOURCES_RE) || []).length;
+function hasMissingTryWithResources(code) {
+  const closeCount = (code.match(MANUAL_CLOSE_RE) || []).length;
+  const tryWithCount = (code.match(TRY_WITH_RESOURCES_RE) || []).length;
   // If there are more manual closes than try-with-resource blocks, flag it
   return closeCount > 0 && closeCount > tryWithCount;
 }
@@ -167,32 +167,38 @@ function extractDependencies(file) {
     imports.push(m[1]);
   }
 
+  // Anti-patterns and resource checks match executable code only; running them
+  // on raw text used to flag javadoc/comments that merely mention Thread.sleep
+  // or .close().  Imports and TODOs above stay on the raw source by design.
+  const code = stripCommentsAndStrings(content);
+
   ANTIPATTERN_RE.lastIndex = 0;
   const antiPatterns = [];
-  while ((m = ANTIPATTERN_RE.exec(content)) !== null) {
+  while ((m = ANTIPATTERN_RE.exec(code)) !== null) {
     antiPatterns.push(m[1]);
   }
 
+  // TODOs live in comments, so read them from the raw source.
   TODO_RE.lastIndex = 0;
   const todos = [];
   while ((m = TODO_RE.exec(content)) !== null) {
     todos.push(m[0].trim());
   }
 
-  const deprecatedCount = (content.match(DEPRECATED_RE) || []).length;
+  const deprecatedCount = (code.match(DEPRECATED_RE) || []).length;
 
   return {
     imports,
-    maxNesting: maxNestingDepth(content),
+    maxNesting: maxNestingDepth(code),
     deprecatedCount,
     antiPatterns: [...new Set(antiPatterns)],
     todos,
     hasTests: hasTestCode(content),
     legacyCollections: findLegacyCollections(content),
     rawTypeCount: countRawTypes(content),
-    uncheckedCastCount: countUncheckedCasts(content),
-    missingTryWithResources: hasMissingTryWithResources(content),
+    uncheckedCastCount: countUncheckedCasts(code),
+    missingTryWithResources: hasMissingTryWithResources(code),
   };
 }
 
-module.exports = { extractDependencies };
+module.exports = { extractDependencies, hasTestCode };

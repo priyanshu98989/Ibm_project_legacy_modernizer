@@ -48,12 +48,38 @@ const ALTER_RE = /\bALTER\s+[\w-]+\s+TO\s+(?:PROCEED\s+TO\s+)?[\w-]+/gi;
 // NEXT SENTENCE — obsolete control transfer; should use CONTINUE or EVALUATE
 const NEXT_SENTENCE_RE = /\bNEXT\s+SENTENCE\b/gi;
 
-// Numeric PIC without COMP/BINARY — display numerics are slow for arithmetic
-// Matches: PIC 9(n) or PIC S9(n) NOT followed by COMP/BINARY/PACKED-DECIMAL
-const PIC_NO_COMP_RE = /\bPIC\s+S?9[9()\s]*(?!\s+(?:COMP|BINARY|PACKED-DECIMAL|COMPUTATIONAL))/gi;
+// PIC clause on a line, plus whatever follows it on that same line
+// Matches:  PIC 9(5)  /  PIC S9(9)V99  /  PIC 9(5)V99 COMP-3
+const PIC_CLAUSE_RE = /\bPIC\s+(?:S?9[\d()VPSP+\-]*)(.*)$/i;
+
+// Binary/decimal storage qualifiers — a numeric field with one of these does
+// NOT suffer the display-numeric arithmetic penalty.
+const BINARY_QUALIFIER_RE = /\b(?:COMP|COMPUTATIONAL|COMP\-\d|COMP-\d|BINARY|PACKED-DECIMAL)\b/i;
 
 // MOVE SPACES/ZEROS to a field — low-severity flag (verbose initialisation style)
 const MOVE_FIGURATIVE_RE = /\bMOVE\s+(?:SPACES?|ZEROS?|ZEROES)\s+TO\b/gi;
+
+/**
+ * Count display-numeric PIC clauses that have no binary storage qualifier.
+ *
+ * The old implementation used a greedy character class plus a negative
+ * lookahead, which swallowed the trailing space before COMP and so flagged
+ * `PIC 9(5) COMP-3` as a display numeric.  This line-based version looks at
+ * the remainder of the clause instead, which is what the rule actually means.
+ *
+ * @param {string} content
+ * @returns {number}
+ */
+function countDisplayNumericPics(content) {
+  let count = 0;
+  for (const line of content.split('\n')) {
+    const m = PIC_CLAUSE_RE.exec(line);
+    if (!m) continue;
+    if (BINARY_QUALIFIER_RE.test(m[1] || '')) continue;
+    count++;
+  }
+  return count;
+}
 
 /**
  * Count PERFORM nesting depth as a proxy for complexity.
@@ -63,6 +89,16 @@ function estimatePerformDepth(content) {
   const matches = content.match(PERFORM_RE) || [];
   // Rough heuristic: number of PERFORMs / 3 as a depth proxy
   return Math.ceil(matches.length / 3);
+}
+
+/**
+ * COBOL has no standard unit-test framework, so this is always false.
+ * Kept for parity with the other parsers — the file scanner calls it uniformly.
+ *
+ * @returns {boolean}
+ */
+function hasTestCode() {
+  return false;
 }
 
 /**
@@ -103,7 +139,7 @@ function extractDependencies(file) {
   const execSqlCount     = (content.match(EXEC_SQL_RE)      || []).length;
   const alterCount       = (content.match(ALTER_RE)         || []).length;
   const nextSentenceCount = (content.match(NEXT_SENTENCE_RE)|| []).length;
-  const picNoCompCount   = (content.match(PIC_NO_COMP_RE)   || []).length;
+  const picNoCompCount   = countDisplayNumericPics(content);
   const moveFigurativeCount = (content.match(MOVE_FIGURATIVE_RE) || []).length;
 
   return {
@@ -122,4 +158,4 @@ function extractDependencies(file) {
   };
 }
 
-module.exports = { extractDependencies };
+module.exports = { extractDependencies, hasTestCode };

@@ -15,6 +15,7 @@
  */
 
 const path = require('path');
+const { stripComments, stripCommentsAndStrings, blockNestingDepth } = require('./sanitize');
 
 // ES6: import X from 'y'  or  import { X } from 'y'
 const IMPORT_RE = /^\s*import\s+.*?\s+from\s+['"]([^'"]+)['"]/gm;
@@ -41,15 +42,13 @@ const TODO_RE = /\/\/.*\b(TODO|FIXME|HACK|XXX)\b/gi;
 const CALLBACK_RE = /\bfunction\s*\(|=>\s*\{/g;
 
 /**
- * Count max brace nesting depth.
+ * Count max *block* nesting depth.
+ *
+ * Uses the shared block-aware counter so that object literals, JSX expression
+ * containers and destructuring patterns are not mistaken for nested logic.
  */
-function maxNestingDepth(content) {
-  let depth = 0, max = 0;
-  for (const ch of content) {
-    if (ch === '{') { depth++; if (depth > max) max = depth; }
-    else if (ch === '}') depth = Math.max(0, depth - 1);
-  }
-  return max;
+function maxNestingDepth(code) {
+  return blockNestingDepth(code);
 }
 
 /**
@@ -96,23 +95,33 @@ function extractDependencies(file) {
   const imports = new Set();
   let m;
 
+  // Imports and TODOs must be read from the raw source: module specifiers live
+  // inside string literals and TODOs live inside comments, both of which the
+  // sanitiser blanks out.
   while ((m = IMPORT_RE.exec(content)) !== null)  imports.add(resolveImportName(m[1]));
   while ((m = REQUIRE_RE.exec(content)) !== null) imports.add(resolveImportName(m[1]));
 
-  const evalCount     = (content.match(EVAL_RE)    || []).length;
-  const consoleCount  = (content.match(CONSOLE_RE) || []).length;
-  const varCount      = (content.match(VAR_RE)     || []).length;
-  const callbackDepth = Math.floor(((content.match(CALLBACK_RE) || []).length) / 3);
+  // Secrets need the string literal to still be readable, but not the comments.
+  const forSecrets = stripComments(content);
+  // Everything else matches against executable code only.
+  const code = stripCommentsAndStrings(content);
+
+  const evalCount     = (code.match(EVAL_RE)    || []).length;
+  const consoleCount  = (code.match(CONSOLE_RE) || []).length;
+  const varCount      = (code.match(VAR_RE)     || []).length;
+  const callbackDepth = Math.floor(((code.match(CALLBACK_RE) || []).length) / 3);
 
   const secrets = [];
-  while ((m = SECRET_RE.exec(content)) !== null) secrets.push(m[0].slice(0, 40));
+  SECRET_RE.lastIndex = 0;
+  while ((m = SECRET_RE.exec(forSecrets)) !== null) secrets.push(m[0].slice(0, 40));
 
   const todos = [];
+  TODO_RE.lastIndex = 0;
   while ((m = TODO_RE.exec(content)) !== null) todos.push(m[0].trim());
 
   return {
     imports: [...imports],
-    maxNesting: maxNestingDepth(content),
+    maxNesting: maxNestingDepth(code),
     evalCount,
     consoleCount,
     varCount,
@@ -123,4 +132,4 @@ function extractDependencies(file) {
   };
 }
 
-module.exports = { extractDependencies };
+module.exports = { extractDependencies, hasTestCode };
