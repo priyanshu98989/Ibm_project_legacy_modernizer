@@ -1,0 +1,31 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+
+  "installCommand": "npm install && npm install --prefix server && npm install --prefix client",
+  "buildCommand": "npm run build --prefix client",
+  "outputDirectory": "client/dist",
+
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 300,
+      "includeFiles": "demo-fixtures/**"
+    }
+  },
+
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "/api" }
+  ],
+
+  "env": {
+    "MAX_FILES": "500",
+    "MAX_TOTAL_SOURCE_BYTES": "67108864",
+    "BOB_SUGGESTION_TIMEOUT_MS": "60000",
+    "MAX_BOB_SUGGESTIONS": "3",
+    "STALE_ANALYSIS_MS": "300000",
+    "MAX_REPORT_BYTES": "4194304",
+    "MAX_UPLOAD_BYTES": "4194304",
+    "MAX_EXTRACT_BYTES": "201326592",
+    "CLONE_TIMEOUT_MS": "60000"
+  }
+}

@@ -50,7 +50,11 @@ Key env vars:
 | `BOB_MODEL`         | `granite3.3`                         | Model name to request                                    |
 | `MAX_BOB_SUGGESTIONS` | `5`                               | How many risky files get AI suggestions (keep low for speed) |
 | `PORT`              | `3001`                               | Express server port                                      |
-| `MAX_UPLOAD_BYTES`  | `52428800` (50 MB)                   | Max ZIP upload size                                      |
+| `MAX_UPLOAD_BYTES`  | `1073741824` (1 GB)                  | Max ZIP upload size                                      |
+| `MAX_EXTRACT_BYTES` | `4294967296` (4 GB)                  | Max size an archive may expand to on disk (zip-bomb guard) |
+| `MAX_EXTRACT_ENTRIES` | `200000`                           | Max number of entries inside an archive                  |
+| `MAX_FILES`         | `5000`                               | Max supported source files per repo                      |
+| `MAX_TOTAL_SOURCE_BYTES` | `268435456` (256 MB)             | Max source text held in memory during analysis           |
 
 ### 3 — Run in development
 

@@ -1,12 +1,25 @@
 /**
  * server/src/routes/upload.js
- * POST /api/upload
  *
- * Accepts either:
- *   - multipart/form-data with field "zipfile" (a .zip archive)
- *   - JSON body { "repoUrl": "https://github.com/..." }
+ * Creates the job record.  Three ways in, because the right one depends on how
+ * the app is deployed:
  *
- * Returns: { jobId }  — client then calls POST /api/analyze/:jobId to kick off analysis.
+ *   Blob deployments (Vercel)
+ *     POST /api/upload/token    — issues a short-lived client-upload token
+ *     POST /api/upload/commit   — the browser has PUT the bytes to Blob already;
+ *                                 register that blob as a job
+ *     The file never passes through a function, which is the only way past
+ *     Vercel's 4.5 MB request body cap.
+ *
+ *   No Blob (plain `npm run dev`, or a self-hosted box)
+ *     POST /api/upload          — ordinary multipart upload, spooled to disk
+ *
+ *   Either way
+ *     POST /api/upload          — { repoUrl } records a GitHub clone job
+ *
+ * All three return { jobId }.  Nothing is analysed here: the clone and the
+ * extraction both happen inside the analyse invocation, because background work
+ * started in one serverless invocation does not survive into the next.
  */
 
 const express = require('express');
@@ -15,113 +28,150 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
-const AdmZip = require('adm-zip');
-const simpleGit = require('simple-git');
-const { createJob, updateJob } = require('../store/jobs');
+const { createJob } = require('../store/jobs');
+const { blobEnabled, handleClientUpload, statBlob, maxUploadBytes, removeBlob } = require('../services/storage');
 
 const router = express.Router();
 
-// ── Multer: store upload in OS temp dir ───────────────────────────────────────
+// ── Multipart fallback (no Blob configured) ────────────────────────────────────
+
 const upload = multer({
   dest: os.tmpdir(),
-  limits: { fileSize: parseInt(process.env.MAX_UPLOAD_BYTES || '52428800', 10) },
+  limits: { fileSize: maxUploadBytes(), files: 1 },
   fileFilter(_req, file, cb) {
     if (!file.originalname.endsWith('.zip')) {
-      return cb(new Error('Only .zip files are accepted for file upload.'));
+      return cb(Object.assign(
+        new Error('Only .zip files are accepted for file upload.'),
+        { status: 400 }
+      ));
     }
     cb(null, true);
   },
 });
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/**
- * Resolve the base directory for job workspaces.
- * Uses TEMP_DIR env var if set, otherwise OS temp dir.
- */
-function baseDir() {
-  return process.env.TEMP_DIR || os.tmpdir();
+/** Accept a repo URL and record the job. */
+function acceptRepoUrl(repoUrl) {
+  if (!/^https?:\/\//.test(repoUrl)) {
+    throw Object.assign(new Error('repoUrl must be an http/https URL.'), { status: 400 });
+  }
+  return { type: 'repo', repoUrl };
 }
 
-/**
- * Extract a ZIP archive into a new job work directory.
- * @param {string} zipPath - path to the uploaded zip file
- * @param {string} jobId
- * @returns {string} workDir
- */
-function extractZip(zipPath, jobId) {
-  const workDir = path.join(baseDir(), `lcm-${jobId}`);
-  fs.mkdirSync(workDir, { recursive: true });
-  const zip = new AdmZip(zipPath);
-  zip.extractAllTo(workDir, true);
-  fs.unlinkSync(zipPath); // remove the raw upload
-  return workDir;
-}
-
-/**
- * Clone a public GitHub repo into a new job work directory.
- * @param {string} repoUrl
- * @param {string} jobId
- * @returns {Promise<string>} workDir
- */
-async function cloneRepo(repoUrl, jobId) {
-  const workDir = path.join(baseDir(), `lcm-${jobId}`);
-  fs.mkdirSync(workDir, { recursive: true });
-  const git = simpleGit();
-  await git.clone(repoUrl, workDir, ['--depth', '1']);
-  return workDir;
-}
-
-// ── Route: ZIP upload ─────────────────────────────────────────────────────────
-router.post('/', upload.single('zipfile'), async (req, res) => {
+// ── POST /api/upload/token ─────────────────────────────────────────────────────
+// Multiplexed by @vercel/blob: the same route issues tokens and receives the
+// upload-complete callback.
+router.post('/token', async (req, res, next) => {
+  if (!blobEnabled()) {
+    return next(Object.assign(
+      new Error('Blob storage is not configured; use the multipart upload endpoint.'),
+      { status: 501 }
+    ));
+  }
   try {
+    const jsonResponse = await handleClientUpload(req);
+    res.status(jsonResponse.status || 200).json(jsonResponse.body);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /api/upload/commit ────────────────────────────────────────────────────
+// Runs after the browser's upload() resolves, so it is the client's own
+// confirmation that the bytes landed — no webhook race.
+router.post('/commit', async (req, res, next) => {
+  try {
+    if (!blobEnabled()) {
+      return res.status(501).json({ error: 'Blob storage is not configured.' });
+    }
+
+    const { pathname, filename, size } = req.body || {};
+    if (typeof pathname !== 'string' || !pathname) {
+      return res.status(400).json({ error: 'Send the uploaded blob `pathname`.' });
+    }
+    if (filename && !filename.toLowerCase().endsWith('.zip')) {
+      return res.status(400).json({ error: 'Only .zip files are accepted for file upload.' });
+    }
+
+    // Confirm the blob really exists and is within the ceiling before creating a
+    // job for it.  Without this, anyone could point a job at an arbitrary blob
+    // in the store and have the analysis invocation fetch it.
+    let info;
+    try {
+      info = await statBlob(pathname);
+    } catch {
+      return res.status(410).json({ error: 'Uploaded archive not found. Please upload again.' });
+    }
+    if (info.size > maxUploadBytes()) {
+      await removeBlob(info.pathname);
+      return res.status(413).json({
+        error: `Upload is ${(info.size / 1024 ** 2).toFixed(0)} MB, over the ` +
+               `${(maxUploadBytes() / 1024 ** 2).toFixed(0)} MB limit.`,
+      });
+    }
+
+    const jobId = uuidv4();
+    await createJob({
+      id: jobId,
+      source: { type: 'blob', pathname: info.pathname, filename: filename || null, size: info.size },
+    });
+
+    return res.json({ jobId });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /api/upload ───────────────────────────────────────────────────────────
+router.post('/', upload.single('zipfile'), async (req, res, next) => {
+  try {
+    // ── Multipart ZIP (no Blob configured) ────────────────────────────────────
     if (req.file) {
-      // ZIP path
       const jobId = uuidv4();
-      const job = createJob(jobId);
-      const workDir = extractZip(req.file.path, jobId);
-      updateJob(jobId, { workDir, status: 'pending' });
+      const dir = path.join(process.env.TEMP_DIR || os.tmpdir(), `lcm-${jobId}`);
+      fs.mkdirSync(dir, { recursive: true });
+      const parked = path.join(dir, 'upload.zip');
+      fs.renameSync(req.file.path, parked);
+
+      await createJob({ id: jobId, source: { type: 'zipfile', zipPath: parked } });
       return res.json({ jobId });
     }
 
-    // JSON body with repoUrl
+    // ── Repository URL ─────────────────────────────────────────────────────────
     const { repoUrl } = req.body || {};
     if (repoUrl) {
-      // Basic URL validation — must be http/https
-      if (!/^https?:\/\//.test(repoUrl)) {
-        return res.status(400).json({ error: 'repoUrl must be an http/https URL.' });
-      }
+      const source = acceptRepoUrl(repoUrl);
       const jobId = uuidv4();
-      createJob(jobId);
-      // Clone asynchronously so we can return the jobId immediately;
-      // the client polls /api/analyze/:jobId which will wait for workDir.
-      // Hard timeout: if git clone takes more than 5 minutes, fail the job.
-      const CLONE_TIMEOUT_MS = 5 * 60 * 1000;
-      const cloneTimer = setTimeout(() => {
-        updateJob(jobId, {
-          status: 'error',
-          error: 'Repository clone timed out after 5 minutes. Try a smaller repo or use ZIP upload instead.',
-        });
-      }, CLONE_TIMEOUT_MS);
-
-      (async () => {
-        try {
-          const workDir = await cloneRepo(repoUrl, jobId);
-          clearTimeout(cloneTimer);
-          updateJob(jobId, { workDir, status: 'pending' });
-        } catch (err) {
-          clearTimeout(cloneTimer);
-          updateJob(jobId, { status: 'error', error: `Clone failed: ${err.message}` });
-        }
-      })();
+      await createJob({ id: jobId, source });
       return res.json({ jobId });
     }
 
     return res.status(400).json({ error: 'Provide a zipfile upload or a repoUrl in the request body.' });
   } catch (err) {
-    console.error('[upload]', err);
-    return res.status(500).json({ error: err.message });
+    // Do not leave a partially-received upload behind.
+    if (req.file?.path) {
+      try { fs.unlinkSync(req.file.path); } catch { /* already gone */ }
+    }
+    next(err);
   }
+});
+
+// Multer signals its own limit breaches here, before the handler runs, so
+// without this middleware an oversized upload surfaces as an opaque 500.
+router.use((err, req, res, next) => {
+  if (req.file?.path) {
+    try { fs.unlinkSync(req.file.path); } catch { /* already removed */ }
+  }
+
+  if (err?.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({
+      error: `Upload exceeds the ${(maxUploadBytes() / 1024 ** 2).toFixed(0)} MB limit.`,
+    });
+  }
+  if (err?.code === 'LIMIT_UNEXPECTED_FILE' || err?.code === 'LIMIT_FILE_COUNT') {
+    return res.status(400).json({ error: 'Send exactly one .zip file in the "zipfile" field.' });
+  }
+  if (err) return next(err);
+  next();
 });
 
 module.exports = router;

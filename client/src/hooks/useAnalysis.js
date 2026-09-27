@@ -1,56 +1,33 @@
 /**
  * client/src/hooks/useAnalysis.js
- * Custom hook that manages the full upload → analyze → poll → report lifecycle.
+ * Custom hook that manages the full upload → analyse → report lifecycle.
  *
  * State machine:
- *   idle → uploading → pending → analyzing → done | error
+ *   idle → uploading → analyzing → done | error
+ *
+ * There is no polling phase any more.  The server used to acknowledge an
+ * analysis job and keep working in the background while the client asked for
+ * status every two seconds; that only works when the server is a long-lived
+ * process.  The analysis is now one awaited request that resolves with the
+ * report, so the hook awaits it directly.
  */
 
-import { useState, useRef, useCallback } from 'react';
-import { uploadZip, submitRepoUrl, startAnalysis, getJobStatus, fetchReport, loadDemoFixture } from '../api';
-
-const POLL_INTERVAL_MS = 2000;
+import { useState, useCallback } from 'react';
+import { uploadZip, submitRepoUrl, runAnalysis, runDemo } from '../api';
 
 export function useAnalysis() {
-  const [phase, setPhase]           = useState('idle');    // idle|uploading|pending|analyzing|done|error
+  const [phase, setPhase]           = useState('idle');    // idle|uploading|analyzing|done|error
   const [uploadProgress, setUploadProgress] = useState(0);
   const [jobId, setJobId]           = useState(null);
   const [report, setReport]         = useState(null);
   const [errorMsg, setErrorMsg]     = useState('');
-  const pollRef = useRef(null);
 
-  /** Stop any running poll timer */
-  const clearPoll = () => {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
-  };
-
-  /** Start polling the job status until done or error */
-  const startPolling = useCallback((id) => {
-    clearPoll();
-    pollRef.current = setInterval(async () => {
-      try {
-        const { status, error } = await getJobStatus(id);
-        if (status === 'done') {
-          clearPoll();
-          setPhase('done');
-          const r = await fetchReport(id);
-          setReport(r);
-        } else if (status === 'error') {
-          clearPoll();
-          setPhase('error');
-          setErrorMsg(error || 'Analysis failed.');
-        } else {
-          setPhase(status); // 'pending' or 'analyzing'
-        }
-      } catch (err) {
-        clearPoll();
-        setPhase('error');
-        setErrorMsg(err.message);
-      }
-    }, POLL_INTERVAL_MS);
+  /** Common tail: finish successfully with a report, or fail with a message. */
+  const settle = useCallback(async (id) => {
+    const { report: finished } = await runAnalysis(id);
+    setJobId(id);
+    setReport(finished);
+    setPhase('done');
   }, []);
 
   /**
@@ -63,62 +40,38 @@ export function useAnalysis() {
       setUploadProgress(0);
       setErrorMsg('');
       const { jobId: id } = await uploadZip(file, setUploadProgress);
-      setJobId(id);
-      setPhase('pending');
-      // Kick off analysis immediately
-      await startAnalysis(id);
+      setUploadProgress(100);
       setPhase('analyzing');
-      startPolling(id);
+      await settle(id);
     } catch (err) {
       setPhase('error');
       setErrorMsg(err.message);
     }
-  }, [startPolling]);
+  }, [settle]);
 
   /**
-   * Submit a GitHub repo URL.
+   * Submit a GitHub repo URL.  The clone happens server-side during the
+   * analysis request, so there is no separate "cloning" phase to show.
    * @param {string} url
    */
   const submitUrl = useCallback(async (url) => {
     try {
       setPhase('uploading');
+      setUploadProgress(100);
       setErrorMsg('');
       const { jobId: id } = await submitRepoUrl(url);
-      setJobId(id);
-      setPhase('pending');
-      // The server clones async; poll until workDir is ready, then start analysis.
-      // startAnalysis returns 202 { status:'pending' } while clone is in progress.
-      const waitForClone = async () => {
-        try {
-          const { status, error } = await getJobStatus(id);
-          if (status === 'error') {
-            setPhase('error');
-            setErrorMsg(error || 'Repository clone failed.');
-            return;
-          }
-          // Try to kick off analysis; server replies 202 if clone not done yet
-          const res = await startAnalysis(id);
-          if (res.status === 'analyzing' || res.status === 'done') {
-            setPhase('analyzing');
-            startPolling(id);
-            return;
-          }
-          // Still pending — try again after 2 s
-          setTimeout(waitForClone, 2000);
-        } catch (err) {
-          // startAnalysis may throw on network error; keep retrying for clone-pending case
-          setTimeout(waitForClone, 2000);
-        }
-      };
-      waitForClone();
+      setPhase('analyzing');
+      await settle(id);
     } catch (err) {
       setPhase('error');
       setErrorMsg(err.message);
     }
-  }, [startPolling]);
+  }, [settle]);
 
   /**
-   * Load a pre-built demo fixture by name (bypasses upload entirely).
+   * Analyse a pre-built demo fixture.  Also a single request — the fixture is
+   * already on the server, so there is nothing to upload and nothing to wait on
+   * between steps.
    * @param {string} fixtureName
    */
   const submitDemo = useCallback(async (fixtureName) => {
@@ -126,21 +79,18 @@ export function useAnalysis() {
       setPhase('uploading');
       setUploadProgress(100);
       setErrorMsg('');
-      const { jobId: id } = await loadDemoFixture(fixtureName);
+      const { jobId: id, report: finished } = await runDemo(fixtureName);
       setJobId(id);
-      setPhase('pending');
-      await startAnalysis(id);
-      setPhase('analyzing');
-      startPolling(id);
+      setReport(finished);
+      setPhase('done');
     } catch (err) {
       setPhase('error');
       setErrorMsg(err.message);
     }
-  }, [startPolling]);
+  }, []);
 
   /** Reset everything back to idle */
   const reset = useCallback(() => {
-    clearPoll();
     setPhase('idle');
     setJobId(null);
     setReport(null);

@@ -2,31 +2,63 @@
  * server/src/routes/report.js
  * GET /api/report/:jobId         — returns the full report as JSON
  * GET /api/report/:jobId/markdown — returns a Markdown-formatted export
+ *
+ * Reports are read back from the job store rather than held in memory, because
+ * on Vercel the invocation that produced them is long gone by the time the user
+ * clicks "Export".
  */
 
 const express = require('express');
-const { getJob } = require('../store/jobs');
+const { getJob, getReport } = require('../store/jobs');
 
 const router = express.Router();
 
-// ── GET /api/report/:jobId ────────────────────────────────────────────────────
-router.get('/:jobId', (req, res) => {
-  const job = getJob(req.params.jobId);
-  if (!job) return res.status(404).json({ error: 'Job not found.' });
-  if (job.status !== 'done') return res.status(202).json({ status: job.status });
-  res.json(job.report);
+/** Load a finished report, or explain why it cannot be served. */
+async function loadReport(req, res) {
+  const job = await getJob(req.params.jobId);
+  if (!job) {
+    res.status(404).json({ error: 'Job not found or expired.' });
+    return null;
+  }
+  if (job.status === 'error') {
+    res.status(422).json({ error: job.error || 'Analysis failed.' });
+    return null;
+  }
+  if (job.status !== 'done') {
+    res.status(202).json({ status: job.status });
+    return null;
+  }
+  const report = await getReport(job.id);
+  if (!report) {
+    res.status(410).json({ error: 'Report is no longer available for this job.' });
+    return null;
+  }
+  return report;
+}
+
+// ── GET /api/report/:jobId ─────────────────────────────────────────────────────
+router.get('/:jobId', async (req, res, next) => {
+  try {
+    const report = await loadReport(req, res);
+    if (report) res.json(report);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ── GET /api/report/:jobId/markdown ──────────────────────────────────────────
-router.get('/:jobId/markdown', (req, res) => {
-  const job = getJob(req.params.jobId);
-  if (!job) return res.status(404).json({ error: 'Job not found.' });
-  if (job.status !== 'done') return res.status(202).json({ status: job.status });
+router.get('/:jobId/markdown', async (req, res, next) => {
+  try {
+    const report = await loadReport(req, res);
+    if (!report) return;
 
-  const md = buildMarkdown(job.report);
-  res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
-  res.setHeader('Content-Disposition', `attachment; filename="modernization-report-${job.id.slice(0, 8)}.md"`);
-  res.send(md);
+    const md = buildMarkdown(report);
+    res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="modernization-report-${req.params.jobId.slice(0, 8)}.md"`);
+    res.send(md);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ── Markdown builder ──────────────────────────────────────────────────────────

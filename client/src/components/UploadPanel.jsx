@@ -170,7 +170,7 @@ export default function UploadPanel({ onZip, onUrl, onDemo }) {
               <Upload size={36} className="text-gray-500" />
               <p className="text-gray-300 font-medium">Drag & drop your ZIP archive here</p>
               <p className="text-gray-500 text-sm">or click to browse</p>
-              <p className="text-gray-600 text-xs mt-1">Max 50 MB · .zip files only · up to 500 source files</p>
+              <p className="text-gray-600 text-xs mt-1">Max 500 MB · .zip files only · up to 500 source files</p>
               <input
                 ref={fileInputRef}
                 type="file"
@@ -207,7 +207,7 @@ export default function UploadPanel({ onZip, onUrl, onDemo }) {
                 )}
               </div>
               <p className="text-gray-600 text-xs">
-                Only public repositories. Shallow-cloned (depth 1). Times out after 5 minutes.
+                Only public repositories. Shallow-cloned (depth 1) while the analysis runs.
               </p>
               <button
                 type="submit"
@@ -224,8 +224,8 @@ export default function UploadPanel({ onZip, onUrl, onDemo }) {
 
       {/* Disclaimer */}
       <p className="mt-6 text-gray-600 text-xs text-center max-w-sm">
-        Code is processed on your local server and never leaves your environment.
-        AI suggestions are powered by IBM Bob.
+        Uploaded archives are analysed by this app's own backend and deleted straight
+        afterwards. AI suggestions are powered by IBM Bob.
       </p>
     </div>
   );

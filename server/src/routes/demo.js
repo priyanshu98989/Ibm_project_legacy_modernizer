@@ -1,27 +1,25 @@
 /**
  * server/src/routes/demo.js
- * GET /api/demo/:name
  *
- * Instantly loads one of the pre-built demo fixtures as a job, skipping the
- * upload step entirely.  Returns { jobId } — the client then calls
- * POST /api/analyze/:jobId as normal.
+ *   GET  /api/demo              — list the available fixtures
+ *   POST /api/demo/:name/analyze — analyse one and return the report
  *
- * Available fixtures (matches the names exposed to the client):
- *   java-legacy-bank      — multi-file Java legacy banking service
- *   cobol-legacy-payroll  — multi-file COBOL legacy payroll batch program
- *   cobol-java-demo       — original mixed demo (customer inquiry)
+ * The demo path is deliberately a single request.  Previously it was two — load
+ * the fixture for a jobId, then POST /api/analyze/:jobId — which only works
+ * while something holds the job in memory between the two calls.  Collapsing it
+ * into one invocation means the job never has to survive anywhere, so the demo
+ * works unchanged on a platform that discards state after every request.
+ *
+ * It is also the cheapest way to try a deployment: no upload, no blob store, no
+ * Redis, nothing but the fixtures bundled alongside the function.
  */
 
 const express = require('express');
-const path = require('path');
-const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
-const { createJob, updateJob } = require('../store/jobs');
+const { runPipeline } = require('../services/pipeline');
+const { resolveFixtureDir } = require('../services/workspace');
 
 const router = express.Router();
-
-// Resolve to demo-fixtures directory relative to this file
-const FIXTURES_DIR = path.resolve(__dirname, '..', '..', '..', 'demo-fixtures');
 
 const ALLOWED_FIXTURES = new Set([
   'java-legacy-bank',
@@ -29,8 +27,20 @@ const ALLOWED_FIXTURES = new Set([
   'cobol-java-demo',
 ]);
 
-// ── GET /api/demo/:name ───────────────────────────────────────────────────────
-router.get('/:name', (req, res) => {
+/** Fixture metadata, mirrored by the client's own list. */
+const FIXTURES = [
+  { name: 'java-legacy-bank',     label: 'Java Legacy Bank',     languages: ['java'],         files: 4 },
+  { name: 'cobol-legacy-payroll', label: 'COBOL Legacy Payroll', languages: ['cobol'],        files: 4 },
+  { name: 'cobol-java-demo',      label: 'Java + COBOL Demo',    languages: ['java', 'cobol'], files: 4 },
+];
+
+// ── GET /api/demo ──────────────────────────────────────────────────────────────
+router.get('/', (_req, res) => {
+  res.json({ fixtures: FIXTURES });
+});
+
+// ── POST /api/demo/:name/analyze ──────────────────────────────────────────────
+router.post('/:name/analyze', async (req, res, next) => {
   const { name } = req.params;
 
   if (!ALLOWED_FIXTURES.has(name)) {
@@ -39,31 +49,16 @@ router.get('/:name', (req, res) => {
     });
   }
 
-  const fixtureDir = path.join(FIXTURES_DIR, name);
-
-  if (!fs.existsSync(fixtureDir)) {
-    return res.status(500).json({
-      error: `Fixture directory not found on server: ${fixtureDir}`,
-    });
-  }
-
   const jobId = uuidv4();
-  createJob(jobId);
-  // Point directly at the fixture directory — no ZIP extraction needed.
-  updateJob(jobId, { workDir: fixtureDir, status: 'pending' });
 
-  return res.json({ jobId });
-});
-
-// ── GET /api/demo — list available fixtures ───────────────────────────────────
-router.get('/', (_req, res) => {
-  res.json({
-    fixtures: [
-      { name: 'java-legacy-bank',     label: 'Java Legacy Bank',     languages: ['java'],         files: 4 },
-      { name: 'cobol-legacy-payroll', label: 'COBOL Legacy Payroll', languages: ['cobol'],        files: 4 },
-      { name: 'cobol-java-demo',      label: 'Java + COBOL Demo',    languages: ['java','cobol'], files: 4 },
-    ],
-  });
+  try {
+    // Points straight at the bundled fixture — nothing is copied or extracted.
+    const workDir = resolveFixtureDir(name);
+    const report = await runPipeline({ jobId, workDir });
+    return res.json({ status: 'done', jobId, fixture: name, report });
+  } catch (err) {
+    return next(err);
+  }
 });
 
 module.exports = router;

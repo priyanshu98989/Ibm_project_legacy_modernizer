@@ -2,182 +2,150 @@
  * server/src/routes/analyze.js
  * POST /api/analyze/:jobId
  *
- * Orchestrates the full analysis pipeline:
- *   1. File scan
- *   2. Dependency graph
- *   3. Static risk scoring
- *   4. Bob AI suggestions (top N risky files to keep demo fast)
- *   5. Executive summary from Bob
- *   6. Report compilation
+ * Materialises the job's source, runs the whole pipeline, stores the report, and
+ * returns it — all inside a single invocation.
  *
- * The route responds immediately with { status: 'analyzing' } and runs
- * the heavy work asynchronously.  The client polls GET /api/analyze/:jobId/status.
+ * This is the core of the Vercel migration.  The original route replied
+ * `{ status: 'analyzing' }` immediately and ran the work in a floating async
+ * IIFE that the client then polled every two seconds.  That depends on a process
+ * staying alive between requests, which is exactly what a serverless function
+ * does not do: it is frozen the instant the response is sent, and the next
+ * request may not even land in the same container.  With jobs in Redis the
+ * polling is no longer needed for correctness, so the work is simply awaited and
+ * the report comes back in the same response.
+ *
+ * GET /:jobId/status is kept purely as a debugging aid.
  */
 
 const express = require('express');
-const { getJob, updateJob } = require('../store/jobs');
-const { scanDirectory } = require('../services/fileScanner');
-const { buildDependencyGraph } = require('../services/dependencyMapper');
-const { scoreFiles } = require('../services/riskScorer');
-const { generateSuggestion, generateExecutiveSummary } = require('../services/bobClient');
-const { compileReport } = require('../services/reportCompiler');
+const { getJob, updateJob, saveReport, getReport } = require('../store/jobs');
+const { runPipeline } = require('../services/pipeline');
+const { prepareWorkspace, cleanupWorkspace, removeBlob } = require('../services/workspace');
 
 const router = express.Router();
 
-// How many risky files to send to Bob for AI suggestions.
-const MAX_BOB_SUGGESTIONS = parseInt(process.env.MAX_BOB_SUGGESTIONS || '5', 10);
-
-// Hard cap: if a repo has more files than this, refuse analysis with a clear error.
-// Prevents OOM/timeout on accidental large monorepo uploads.
-const MAX_FILES = parseInt(process.env.MAX_FILES || '500', 10);
-
-// Per-file Bob suggestion timeout (ms) — prevents a single slow Bob call hanging the job.
-const BOB_SUGGESTION_TIMEOUT_MS = parseInt(process.env.BOB_SUGGESTION_TIMEOUT_MS || '90000', 10);
+/**
+ * A job stuck in `analyzing` is usually an invocation that was killed by the
+ * platform's duration limit rather than one still running.  After this long it
+ * is safe for a new request to take the job over.
+ */
+const STALE_ANALYSIS_MS = parseInt(process.env.STALE_ANALYSIS_MS || '300000', 10); // 5 min
 
 /**
- * Wrap a promise with a timeout.  Rejects with a clear message if the
- * promise doesn't resolve within `ms` milliseconds.
+ * Vercel rejects a response body over 4.5 MB with an opaque 413.  The report is
+ * the only large thing we return, so it is measured before sending and reported
+ * as a normal error the client can display.
  */
-function withTimeout(promise, ms, label) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`Timed out after ${ms / 1000}s waiting for ${label}`)),
-      ms
-    );
-    promise.then(
-      v => { clearTimeout(timer); resolve(v); },
-      e => { clearTimeout(timer); reject(e); }
-    );
-  });
+const MAX_REPORT_BYTES = parseInt(process.env.MAX_REPORT_BYTES || String(4 * 1024 * 1024), 10);
+
+/** True when `analyzing` is stale enough to reclaim. */
+function isStale(job) {
+  if (job.status !== 'analyzing') return false;
+  const startedAt = new Date(job.startedAt || job.createdAt).getTime();
+  return Date.now() - startedAt > STALE_ANALYSIS_MS;
+}
+
+/** Is this invocation the one that should do the work? */
+function shouldRun(job) {
+  if (job.status !== 'analyzing') return true;
+  return isStale(job);
 }
 
 // ── POST /api/analyze/:jobId ──────────────────────────────────────────────────
-router.post('/:jobId', async (req, res) => {
-  const job = getJob(req.params.jobId);
-  if (!job) return res.status(404).json({ error: 'Job not found.' });
+router.post('/:jobId', async (req, res, next) => {
+  let job;
+  try {
+    job = await getJob(req.params.jobId);
+  } catch (err) {
+    return next(err);
+  }
+  if (!job) return res.status(404).json({ error: 'Job not found or expired.' });
 
-  // If the clone is still in progress, workDir may not be set yet
-  if (!job.workDir) {
-    return res.status(202).json({ status: 'pending', message: 'Repository is still being cloned. Try again shortly.' });
+  // Already finished — serve the stored report.  Makes a retried request cheap
+  // and idempotent.
+  if (job.status === 'done') {
+    const report = await getReport(job.id);
+    if (report) return res.json({ status: 'done', jobId: job.id, report });
+    return res.status(410).json({ error: 'Report is no longer available for this job.' });
   }
 
-  if (job.status === 'analyzing' || job.status === 'done') {
-    return res.json({ status: job.status, jobId: job.id });
+  if (job.status === 'error') {
+    return res.status(422).json({ error: job.error || 'Analysis previously failed.', jobId: job.id });
   }
 
-  // Kick off analysis in the background
-  updateJob(job.id, { status: 'analyzing' });
-  res.json({ status: 'analyzing', jobId: job.id });
+  // Another invocation holds this job.  Let it finish rather than duplicating
+  // the work; the client is still awaiting the original response.
+  if (!shouldRun(job)) {
+    return res.status(409).json({
+      status: 'analyzing',
+      jobId: job.id,
+      error: 'This analysis is already running. Retry shortly to collect the report.',
+    });
+  }
 
-  // ── Background pipeline ──────────────────────────────────────────────────
-  (async () => {
-    try {
-      // Step 1 — Scan files
-      const files = scanDirectory(job.workDir, job.workDir);
-      if (files.length === 0) {
-        return updateJob(job.id, {
-          status: 'error',
-          error: 'No supported source files found (expected .java, .cbl/.cob/.cobol, or .js/.jsx).',
-        });
-      }
-      if (files.length > MAX_FILES) {
-        return updateJob(job.id, {
-          status: 'error',
-          error: `Repository is too large: ${files.length} supported files found (limit is ${MAX_FILES}). ` +
-                 `Upload a smaller subset or increase MAX_FILES in your .env.`,
-        });
-      }
-      updateJob(job.id, { files });
+  const startedAt = new Date().toISOString();
 
-      // Step 2 — Dependency graph
-      const dependencyGraph = buildDependencyGraph(files);
-      updateJob(job.id, { dependencyGraph });
+  try {
+    await updateJob(job.id, { status: 'analyzing', startedAt, error: null });
 
-      // Step 3 — Static risk scoring
-      const risks = scoreFiles(files);
-      updateJob(job.id, { risks });
+    const { workDir, cleanupBlob } = await prepareWorkspace(job);
 
-      // Step 4 — Bob AI suggestions for top risky files
-      const topRisks = risks.slice(0, MAX_BOB_SUGGESTIONS);
-      const suggestions = [];
+    const report = await runPipeline({ jobId: job.id, workDir });
 
-      for (const risk of topRisks) {
-        const fileObj = files.find(f => f.path === risk.file);
-        if (!fileObj) continue;
-        try {
-          const { suggestion, diff } = await withTimeout(
-            generateSuggestion({
-              file:     risk.file,
-              language: risk.language,
-              severity: risk.severity,
-              issues:   risk.issues,
-              content:  fileObj.content,
-            }),
-            BOB_SUGGESTION_TIMEOUT_MS,
-            `Bob suggestion for ${risk.file}`
-          );
-          suggestions.push({ file: risk.file, suggestion, diff });
-        } catch (err) {
-          // Don't fail the whole job if Bob is unavailable or slow for one file
-          console.error(`[analyze] Bob suggestion failed for ${risk.file}:`, err.message);
-          suggestions.push({
-            file: risk.file,
-            suggestion: `AI suggestion unavailable: ${err.message}`,
-            diff: '',
-          });
-        }
-      }
-      updateJob(job.id, { suggestions });
-
-      // Step 5 — Executive summary
-      const highCount   = risks.filter(r => r.severity === 'high').length;
-      const mediumCount = risks.filter(r => r.severity === 'medium').length;
-      const lowCount    = risks.filter(r => r.severity === 'low').length;
-      const languages   = [...new Set(files.map(f => f.language))];
-
-      let executiveSummary = '';
-      try {
-        executiveSummary = await withTimeout(
-          generateExecutiveSummary({
-            fileCount: files.length,
-            languages,
-            highCount,
-            mediumCount,
-            lowCount,
-            healthScore: 0,
-          }),
-          BOB_SUGGESTION_TIMEOUT_MS,
-          'Bob executive summary'
-        );
-      } catch (err) {
-        console.error('[analyze] Executive summary generation failed:', err.message);
-        executiveSummary = 'Executive summary unavailable — Bob API not reachable or timed out.';
-      }
-
-      // Step 6 — Compile report
-      const report = compileReport({
-        jobId: job.id,
-        files,
-        dependencyGraph,
-        risks,
-        suggestions,
-        executiveSummary,
-      });
-
-      updateJob(job.id, { report, status: 'done' });
-      console.log(`[analyze] Job ${job.id} completed. Health score: ${report.healthScore}`);
-    } catch (err) {
-      console.error(`[analyze] Job ${job.id} failed:`, err);
-      updateJob(job.id, { status: 'error', error: err.message });
+    const reportBytes = Buffer.byteLength(JSON.stringify(report), 'utf8');
+    if (reportBytes > MAX_REPORT_BYTES) {
+      throw Object.assign(
+        new Error(
+          `The report for this codebase is ${(reportBytes / 1024 ** 2).toFixed(1)} MB, over the ` +
+          `${(MAX_REPORT_BYTES / 1024 ** 2).toFixed(1)} MB response limit. ` +
+          `Analyse a smaller subset — a lower MAX_FILES will keep reports within the limit.`
+        ),
+        { status: 413 }
+      );
     }
-  })();
+
+    await saveReport(job.id, report);
+    await updateJob(job.id, { status: 'done', reportBytes, finishedAt: new Date().toISOString() });
+
+    // The archive has served its purpose.  Not awaiting is fine — removeBlob
+    // never throws, and holding the response open for a cleanup round trip
+    // would eat into the duration budget.
+    removeBlob(cleanupBlob);
+
+    console.log(`[analyze] Job ${job.id} completed in one invocation. Health score: ${report.healthScore}`);
+    return res.json({ status: 'done', jobId: job.id, report });
+  } catch (err) {
+    try {
+      await updateJob(job.id, { status: 'error', error: err.message });
+    } catch (storeErr) {
+      console.error('[analyze] Could not record failure:', storeErr.message);
+    }
+    return next(err);
+  } finally {
+    // Runs on both paths.  The scratch directory is dead weight once the
+    // response is written, and on Vercel /tmp is wiped anyway.
+    cleanupWorkspace(job.id);
+  }
 });
 
 // ── GET /api/analyze/:jobId/status ────────────────────────────────────────────
-router.get('/:jobId/status', (req, res) => {
-  const job = getJob(req.params.jobId);
-  if (!job) return res.status(404).json({ error: 'Job not found.' });
-  res.json({ status: job.status, error: job.error || null });
+// Debugging aid: on a deployed function the invocation logs are not always
+// reachable, so this is the quickest way to see where a job got to.
+router.get('/:jobId/status', async (req, res, next) => {
+  try {
+    const job = await getJob(req.params.jobId);
+    if (!job) return res.status(404).json({ error: 'Job not found or expired.' });
+    res.json({
+      status: job.status,
+      error: job.error || null,
+      sourceType: job.source?.type || null,
+      startedAt: job.startedAt || null,
+      finishedAt: job.finishedAt || null,
+      reportBytes: job.reportBytes || null,
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 module.exports = router;

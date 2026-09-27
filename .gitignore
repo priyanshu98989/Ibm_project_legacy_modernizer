@@ -30,3 +30,11 @@ Thumbs.db
 tmp/
 temp/
 .cache/
+
+.vercel
+.env*
+
+# Local agent tooling installed by the Vercel CLI (vendor docs, not app source)
+.agents/
+.claude/
+skills-lock.json
