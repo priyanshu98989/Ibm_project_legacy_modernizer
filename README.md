@@ -25,7 +25,6 @@ Supported languages: **Java** (`.java`), **COBOL** (`.cbl` / `.cob` / `.cobol`),
 
 - Node.js 18+
 - A running IBM Bob instance (or any OpenAI-compatible API)
-- `git` on your PATH (for GitHub URL cloning)
 
 ### 1 — Install
 
@@ -53,6 +52,7 @@ Key env vars:
 | `MAX_UPLOAD_BYTES`  | `1073741824` (1 GB)                  | Max ZIP upload size                                      |
 | `MAX_EXTRACT_BYTES` | `4294967296` (4 GB)                  | Max size an archive may expand to on disk (zip-bomb guard) |
 | `MAX_EXTRACT_ENTRIES` | `200000`                           | Max number of entries inside an archive                  |
+| `MAX_REPO_BYTES`    | `104857600` (100 MB)                | Max size of a repository archive downloaded from GitHub  |
 | `MAX_FILES`         | `5000`                               | Max supported source files per repo                      |
 | `MAX_TOTAL_SOURCE_BYTES` | `268435456` (256 MB)             | Max source text held in memory during analysis           |
 
